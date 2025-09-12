@@ -1,0 +1,251 @@
+#%%
+
+from osgeo import gdal, ogr, osr
+
+import numpy as np
+
+######## This code's purpose is to create a shp. file that lines up perfectly with landsat pixels. This is important for when aggregating drone images to landsat resolution so that the pixels line up.
+
+######### This code requires 1. Landsat raster 2. .shp file of field of interest (within the bounds of the Landsat raster)
+
+
+#Funtion to clip LS tif
+
+#%%
+
+def clip_raster_with_shapefile(input_raster, input_shapefile, output_raster):
+
+    # Open the raster file
+
+    raster_ds = gdal.Open(input_raster)
+
+    if raster_ds is None:
+
+        print("Could not open the raster file")
+
+        return
+
+
+    # Open the shapefile
+
+    shape_ds = ogr.Open(input_shapefile)
+
+    if shape_ds is None:
+
+        print("Could not open the shapefile")
+
+        return
+
+
+    # Clip the raster with the shapefile
+
+    gdal.Warp(output_raster, raster_ds, cutlineDSName=input_shapefile, cropToCutline=True)
+
+
+    # Close datasets
+
+    raster_ds = None
+
+    shape_ds = None
+
+
+    # Open the clipped raster
+
+    clipped_ds = gdal.Open(output_raster, gdal.GA_Update)
+
+    if clipped_ds is None:
+
+        print("Error: Could not open the clipped GeoTIFF")
+
+        return
+
+
+    # Iterate through each band and remove 0, NaN, and nodata pixels NOTE: This is neccesary for non-square fields
+
+    for i in range(1, clipped_ds.RasterCount + 1):
+
+        band = clipped_ds.GetRasterBand(i)
+
+        band_array = band.ReadAsArray()
+
+        band_array[(band_array == 0) | np.isnan(band_array) | (band_array == band.GetNoDataValue())] = np.nan
+
+        band.WriteArray(band_array)
+
+
+    # Close the clipped raster dataset
+
+    clipped_ds = None
+
+#%%
+
+### Creates a shape file from clipped LS tif. In order to work with tifs with nans (e.g. fields that are not 4-sided), this code has several funtions. 1) create a polygon for each pixel that has a value other than nan
+
+### 2) Combine all of the polygons into one polygon 3) Create a .shp file using the polygon.  
+
+def create_polygon_from_pixel(geotransform, col, row, pixel_size):
+
+    x_origin, pixel_width, _, y_origin, _, pixel_height = geotransform
+
+    x1 = x_origin + col * pixel_width
+
+    y1 = y_origin + row * pixel_height
+
+    x2 = x1 + pixel_width
+
+    y2 = y1
+
+    x3 = x2
+
+    y3 = y2 + pixel_height
+
+    x4 = x1
+
+    y4 = y1 + pixel_height
+
+
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+
+    ring.AddPoint(x1, y1)
+
+    ring.AddPoint(x2, y2)
+
+    ring.AddPoint(x3, y3)
+
+    ring.AddPoint(x4, y4)
+
+    ring.AddPoint(x1, y1)  # Close the ring
+
+
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+
+    polygon.AddGeometry(ring)
+
+
+    return polygon
+
+
+def combine_polygons(polygons):
+
+    if len(polygons) == 0:
+
+        return None
+
+
+    # Combine polygons into a single polygon
+
+    multipolygon = ogr.Geometry(ogr.wkbMultiPolygon)
+
+    for polygon in polygons:
+
+        multipolygon.AddGeometry(polygon)
+
+
+    return multipolygon.UnionCascaded()
+
+
+def create_shapefile_from_raster(output_raster, output_shapefile):
+
+    raster_ds = gdal.Open(output_raster)
+
+    if raster_ds is None:
+
+        print("Could not open the raster file")
+
+        return
+
+
+    width = raster_ds.RasterXSize
+
+    height = raster_ds.RasterYSize
+
+
+    geotransform = raster_ds.GetGeoTransform()
+
+    projection = raster_ds.GetProjection()
+
+
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+
+    data_source = driver.CreateDataSource(output_shapefile)
+
+    if data_source is None:
+
+        print("Error: Could not create data source")
+
+        return
+
+
+    spatial_ref = osr.SpatialReference()
+
+    spatial_ref.ImportFromWkt(projection)
+
+
+    layer = data_source.CreateLayer("polygon", spatial_ref, ogr.wkbPolygon)
+
+    if layer is None:
+
+        print("Error: Could not create layer")
+
+        return
+
+
+    valid_polygons = []
+
+    for i in range(1, raster_ds.RasterCount + 1):
+
+        band = raster_ds.GetRasterBand(i)
+
+        band_array = band.ReadAsArray()
+
+        for col in range(width):
+
+            for row in range(height):
+
+                pixel_value = band_array[row][col]
+
+                if not np.isnan(pixel_value) and pixel_value != 0:  # Skip nodata and 0 pixels
+
+                    pixel_polygon = create_polygon_from_pixel(geotransform, col, row, 30)  # Assuming pixel size is 30x30 meters
+
+                    valid_polygons.append(pixel_polygon)
+
+
+    merged_polygon = combine_polygons(valid_polygons)
+
+    if merged_polygon is not None:
+
+        feature = ogr.Feature(layer.GetLayerDefn())
+
+        feature.SetGeometry(merged_polygon)
+
+        layer.CreateFeature(feature)
+
+        feature = None
+
+
+    data_source = None
+
+#%%
+
+# Define input and output files
+
+input_raster = "E:/Python/Tiff_outputs/ART/20240213/ART_20240213_DIS_ET.tif"
+
+output_raster = "E:/Python/Tiff_outputs/ART/20240213/ART_20240213_DIS_ET_clipped.tif"
+
+input_shapefile = "E:/Python/.shp files/ART.shp"
+
+output_shapefile = "E:/Python/.shp files/ART_LSclip.shp"
+
+#clip LS
+
+clip_raster_with_shapefile(input_raster, input_shapefile, output_raster)
+
+#%%
+
+#create new shp. file
+
+create_shapefile_from_raster(output_raster, output_shapefile)
+
+# %%
